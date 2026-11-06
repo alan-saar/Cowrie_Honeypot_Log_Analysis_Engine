@@ -1,14 +1,41 @@
 """
-Módulo de Leitura Otimizada de Logs do Cowrie a partir de Arquivos Apache Parquet
-Compatível com a estrutura de logs do projeto dpipot-analytics (data/dpipot-pods-*.parquet).
+Módulo de Leitura e Enriquecimento de Logs do Cowrie a partir de Arquivos Apache Parquet
+Compatível com a estrutura de logs do projeto dpipot-analytics (data/dpipot-pods-*.parquet e data/dpipot-proxy-*.parquet).
 """
 
 import os
 import glob
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import duckdb
 import pandas as pd
+
+
+def parse_date_filter(
+    date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Normaliza os parâmetros de data recebidos.
+    Suporta:
+      - date='2026.07.27' ou date='2026-07-27'
+      - date='2026.07.27:2026.07.28' (intervalo)
+      - start_date / end_date separados
+    Retorna: (start_date_iso, end_date_iso) no formato 'YYYY-MM-DD'
+    """
+    if date:
+        if ":" in date:
+            parts = date.split(":", 1)
+            s_date = parts[0].strip().replace(".", "-")
+            e_date = parts[1].strip().replace(".", "-")
+            return s_date, e_date
+        single = date.strip().replace(".", "-")
+        return single, single
+
+    s_date = start_date.strip().replace(".", "-") if start_date else None
+    e_date = end_date.strip().replace(".", "-") if end_date else None
+    return s_date, e_date
 
 
 def list_available_parquet_dates(data_dir: str = "data") -> List[str]:
@@ -28,94 +55,178 @@ def list_available_parquet_dates(data_dir: str = "data") -> List[str]:
     return dates
 
 
-def read_cowrie_from_parquet(
+def _filter_files_by_date(files: List[str], prefix: str, start_iso: Optional[str], end_iso: Optional[str]) -> List[str]:
+    """Filtra lista de arquivos Parquet pelo intervalo de datas no nome do arquivo."""
+    if not start_iso and not end_iso:
+        return sorted(files)
+
+    selected = []
+    date_regex = re.compile(rf"{prefix}-(\d{{4}})[.-](\d{{2}})[.-](\d{{2}})\.parquet")
+    for f in sorted(files):
+        match = date_regex.search(os.path.basename(f))
+        if match:
+            file_date_iso = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+            if start_iso and file_date_iso < start_iso:
+                continue
+            if end_iso and file_date_iso > end_iso:
+                continue
+            selected.append(f)
+    return selected
+
+
+def read_cowrie_sessions(
     data_dir: str = "data",
     date: Optional[str] = None,
-    only_commands: bool = True
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    enrich_proxy: bool = True
 ) -> pd.DataFrame:
     """
-    Lê os logs do Cowrie diretamente dos arquivos Apache Parquet em data_dir usando DuckDB.
+    Lê os comandos das sessões Cowrie dos arquivos Parquet de pods e opcionalmente
+    enriquece com IP real, país e organização ASN a partir dos arquivos de proxy.
 
-    Aplica filtros via push-down predicates para evitar carregar gigabytes desnecessários
-    em memória RAM.
-
-    Args:
-        data_dir: Diretório onde estão os arquivos Parquet (padrão: 'data').
-        date: Data específica no formato 'YYYY.MM.DD' ou 'YYYY-MM-DD'. Se None, lê todos os dias.
-        only_commands: Se True, extrai apenas eventos de comando (cowrie.command.input).
-
-    Returns:
-        DataFrame do pandas com as colunas relevantes para o pipeline de análise.
+    Retorna um DataFrame agrupado por sessão contendo:
+      ['session', 'src_ip', 'country', 'asn_org', 'commands', 'start_time', 'command_count']
     """
-    if date:
-        normalized_date = date.replace("-", ".")
-        pattern = os.path.join(data_dir, f"dpipot-pods-*{normalized_date}*.parquet")
-    else:
-        pattern = os.path.join(data_dir, "dpipot-pods-*.parquet")
+    start_iso, end_iso = parse_date_filter(date, start_date, end_date)
 
-    files = sorted(glob.glob(pattern))
-    if not files:
-        print(f"[AVISO] Nenhum arquivo Parquet encontrado com o padrão: {pattern}")
-        return pd.DataFrame(columns=["session", "src_ip", "input", "timestamp", "eventid"])
+    all_pod_files = glob.glob(os.path.join(data_dir, "dpipot-pods-*.parquet"))
+    pod_files = _filter_files_by_date(all_pod_files, "dpipot-pods", start_iso, end_iso)
 
-    print(f"[PARQUET] Encontrado(s) {len(files)} arquivo(s) Parquet para leitura:")
-    for f in files:
-        size_mb = os.path.getsize(f) / (1024 * 1024)
-        print(f"  • {os.path.basename(f)} ({size_mb:.1f} MB)")
+    if not pod_files:
+        print(f"[AVISO] Nenhum arquivo Parquet de pods encontrado no intervalo [{start_iso} até {end_iso}].")
+        return pd.DataFrame(columns=["session", "src_ip", "country", "asn_org", "commands", "start_time", "command_count"])
+
+    print(f"[PARQUET] Processando {len(pod_files)} arquivo(s) de pods Cowrie:")
+    for f in pod_files:
+        print(f"  • {os.path.basename(f)}")
 
     con = duckdb.connect()
     con.execute("PRAGMA threads=8;")
-    files_str = ", ".join([f"'{f}'" for f in files])
+    pod_files_str = ", ".join([f"'{f}'" for f in pod_files])
 
-    if only_commands:
+    # Verificar se temos arquivos do proxy para enriquecer
+    proxy_files = []
+    if enrich_proxy:
+        all_proxy_files = glob.glob(os.path.join(data_dir, "dpipot-proxy-*.parquet"))
+        proxy_files = _filter_files_by_date(all_proxy_files, "dpipot-proxy", start_iso, end_iso)
+
+    if enrich_proxy and proxy_files:
+        print(f"[PARQUET] Enriquecendo com {len(proxy_files)} arquivo(s) de Proxy DPIpot:")
+        for f in proxy_files:
+            print(f"  • {os.path.basename(f)}")
+
+        proxy_files_str = ", ".join([f"'{f}'" for f in proxy_files])
+
         query = f"""
-        SELECT
-            session,
-            src_ip,
-            REGEXP_EXTRACT("event.original", 'CMD: (.*)', 1) AS input,
-            "@timestamp" AS timestamp,
-            COALESCE(eventid, 'cowrie.command.input') AS eventid
-        FROM read_parquet([{files_str}], union_by_name=true)
-        WHERE (
-            COALESCE(eventid, '') = 'cowrie.command.input'
-            OR "event.original" LIKE 'CMD: %'
+        WITH raw_commands AS (
+            SELECT 
+                session,
+                FIRST(src_ip) AS pod_ip,
+                MIN("@timestamp") AS start_time,
+                REGEXP_EXTRACT("event.original", 'CMD: (.*)', 1) AS cmd,
+                MAX(REGEXP_EXTRACT("event.original", 'login attempt \\[(.*)/(.*)\\] succeeded', 2)) AS password_used
+            FROM read_parquet([{pod_files_str}], union_by_name=true)
+            WHERE session IS NOT NULL
+              AND (
+                COALESCE("kubernetes.labels.app", '') = 'cowrie'
+                OR COALESCE(eventid, '') LIKE 'cowrie%'
+              )
+            GROUP BY session, "event.original", "@timestamp"
+        ),
+        session_cmds AS (
+            SELECT 
+                session,
+                FIRST(pod_ip) AS pod_ip,
+                MIN(start_time) AS start_time,
+                MAX(password_used) AS password_used,
+                LIST(cmd) FILTER (WHERE cmd IS NOT NULL AND cmd != '') AS commands,
+                COUNT(cmd) FILTER (WHERE cmd IS NOT NULL AND cmd != '') AS command_count
+            FROM raw_commands
+            GROUP BY session
+            HAVING command_count > 0
+        ),
+        proxy_auth AS (
+            SELECT 
+                src_ip AS real_ip,
+                "src_geo.country_name" AS country,
+                "src_asn.organization_name" AS asn_org,
+                attack_type AS password,
+                "@timestamp" AS proxy_time
+            FROM read_parquet([{proxy_files_str}], union_by_name=true)
+            WHERE honeypot = 'cowrie-svc:22' 
+              AND ndpi_app = 'password'
+              AND attack_type IS NOT NULL
         )
-        AND "event.original" IS NOT NULL
+        SELECT 
+            sc.session,
+            COALESCE(pa.real_ip, sc.pod_ip) AS src_ip,
+            COALESCE(pa.country, 'Unknown') AS country,
+            COALESCE(pa.asn_org, 'Unknown') AS asn_org,
+            sc.commands,
+            sc.start_time,
+            sc.command_count
+        FROM session_cmds sc
+        LEFT JOIN (
+            -- Obter o match mais próximo no tempo se houver múltiplos
+            SELECT 
+                password,
+                real_ip,
+                country,
+                asn_org,
+                proxy_time,
+                ROW_NUMBER() OVER (PARTITION BY password ORDER BY proxy_time) as rn
+            FROM proxy_auth
+        ) pa ON sc.password_used = pa.password AND pa.rn = 1
+        ORDER BY sc.start_time
         """
     else:
+        # Sem enriquecimento com proxy
         query = f"""
-        SELECT
-            session,
-            src_ip,
-            dst_ip,
-            protocol,
-            REGEXP_EXTRACT("event.original", 'CMD: (.*)', 1) AS input,
-            "@timestamp" AS timestamp,
-            eventid,
-            "event.original" AS raw_log
-        FROM read_parquet([{files_str}], union_by_name=true)
-        WHERE (
-            COALESCE("kubernetes.labels.app", '') = 'cowrie'
-            OR COALESCE(eventid, '') LIKE 'cowrie%'
+        WITH raw_commands AS (
+            SELECT 
+                session,
+                FIRST(src_ip) AS pod_ip,
+                MIN("@timestamp") AS start_time,
+                REGEXP_EXTRACT("event.original", 'CMD: (.*)', 1) AS cmd
+            FROM read_parquet([{pod_files_str}], union_by_name=true)
+            WHERE session IS NOT NULL
+              AND (
+                COALESCE("kubernetes.labels.app", '') = 'cowrie'
+                OR COALESCE(eventid, '') LIKE 'cowrie%'
+              )
+            GROUP BY session, "event.original", "@timestamp"
         )
+        SELECT 
+            session,
+            FIRST(pod_ip) AS src_ip,
+            'Unknown' AS country,
+            'Unknown' AS asn_org,
+            LIST(cmd) FILTER (WHERE cmd IS NOT NULL AND cmd != '') AS commands,
+            MIN(start_time) AS start_time,
+            COUNT(cmd) FILTER (WHERE cmd IS NOT NULL AND cmd != '') AS command_count
+        FROM raw_commands
+        GROUP BY session
+        HAVING command_count > 0
+        ORDER BY start_time
         """
 
-    print("[PARQUET] Executando consulta SQL colunar com DuckDB...")
+    print("[PARQUET] Executando agregação e cruzamento de sessões com DuckDB...")
     df = con.sql(query).df()
-    print(f"[PARQUET] Total de eventos extraídos: {len(df):,}")
-
+    print(f"[PARQUET] Total de sessões ativas extraídas: {len(df):,}")
     return df
 
 
 if __name__ == "__main__":
     import sys
-    target_date = sys.argv[1] if len(sys.argv) > 1 else None
-    print("--- Teste do Leitor Parquet Cowrie ---")
-    available = list_available_parquet_dates()
-    print(f"Datas disponíveis: {available}")
-
-    df_cowrie = read_cowrie_from_parquet(date=target_date)
-    print("\nResumo do DataFrame retornado:")
-    print(df_cowrie.info())
-    print("\nPrimeiros 5 registros:")
-    print(df_cowrie.head())
+    print("=== Teste do Leitor de Sessões Cowrie (Parquet + Proxy) ===")
+    arg_date = sys.argv[1] if len(sys.argv) > 1 else None
+    
+    sessions_df = read_cowrie_sessions(date=arg_date)
+    print("\nInformações das sessões:")
+    print(sessions_df.info())
+    print("\nTop 5 Sessões Extraídas:")
+    print(sessions_df[["session", "src_ip", "country", "asn_org", "command_count"]].head())
+    
+    print("\nDistribuição por País:")
+    print(sessions_df["country"].value_counts().head(10))

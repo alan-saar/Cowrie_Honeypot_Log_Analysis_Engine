@@ -1,2 +1,5 @@
 data
 devrefs
+__pycache__/
+*.pyc
+tmp-analysis
